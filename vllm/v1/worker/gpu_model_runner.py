@@ -389,6 +389,9 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    # Per-layer hidden states indexed by logits_indices, keyed by layer index.
+    # Only populated when any request has hidden_state_layer_ids set.
+    captured_hidden_states: dict[int, torch.Tensor] | None = None
 
 
 class GPUModelRunner(
@@ -3856,6 +3859,17 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            # Collect transformer layer IDs that any request wants captured.
+            _hs_layer_ids: set[int] = set()
+            for _rid in req_ids[:num_reqs]:
+                _rs = self.requests.get(_rid)
+                if (
+                    _rs is not None
+                    and _rs.sampling_params is not None
+                    and _rs.sampling_params.hidden_state_layer_ids
+                ):
+                    _hs_layer_ids.update(_rs.sampling_params.hidden_state_layer_ids)
+
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
@@ -4002,6 +4016,29 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        # If any request wants intermediate hidden states, forward hooks must
+        # run – this is incompatible with CUDA graph replay.
+        _captured_layer_tensors: dict[int, torch.Tensor] = {}
+        _hs_hooks: list[torch.utils.hooks.RemovableHandle] = []
+        if _hs_layer_ids:
+            cudagraph_mode = CUDAGraphMode.NONE
+            _model_layers = getattr(
+                getattr(self.model, "model", None), "layers", None
+            )
+            if _model_layers is not None:
+                for _lid in _hs_layer_ids:
+                    if 0 <= _lid < len(_model_layers):
+                        def _make_hs_hook(idx: int):
+                            def _hs_hook(module, inp, out):
+                                hs = out[0] if isinstance(out, tuple) else out
+                                _captured_layer_tensors[idx] = hs
+                            return _hs_hook
+                        _hs_hooks.append(
+                            _model_layers[_lid].register_forward_hook(
+                                _make_hs_hook(_lid)
+                            )
+                        )
+
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
@@ -4039,6 +4076,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            # Remove forward hooks immediately after the forward pass.
+            for _h in _hs_hooks:
+                _h.remove()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4099,6 +4139,18 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        # Index the captured intermediate hidden states by logits_indices so
+        # that each entry corresponds to a single request's token position.
+        # Shape: [num_reqs, hidden_size] per layer.
+        _indexed_hidden_states: dict[int, torch.Tensor] | None = (
+            {
+                _lid: _hs[logits_indices]
+                for _lid, _hs in _captured_layer_tensors.items()
+            }
+            if _captured_layer_tensors
+            else None
+        )
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4110,6 +4162,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            _indexed_hidden_states,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4154,6 +4207,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            captured_hidden_states,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -4320,6 +4374,29 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            # Build per-request hidden-state output from the captured tensors.
+            hidden_states_output: list[dict[int, torch.Tensor] | None] | None = None
+            if captured_hidden_states:
+                hidden_states_output = []
+                for _rid in req_ids_output_copy:
+                    _rs = self.requests.get(_rid)
+                    if (
+                        _rs is not None
+                        and _rs.sampling_params is not None
+                        and _rs.sampling_params.hidden_state_layer_ids
+                    ):
+                        _batch_idx = req_id_to_index_output_copy[_rid]
+                        _req_hs: dict[int, torch.Tensor] = {
+                            _lid: captured_hidden_states[_lid][_batch_idx].to(
+                                "cpu", non_blocking=True
+                            )
+                            for _lid in _rs.sampling_params.hidden_state_layer_ids
+                            if _lid in captured_hidden_states
+                        }
+                        hidden_states_output.append(_req_hs or None)
+                    else:
+                        hidden_states_output.append(None)
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -4332,6 +4409,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                hidden_states_output=hidden_states_output,
             )
 
         if not self.use_async_scheduling:

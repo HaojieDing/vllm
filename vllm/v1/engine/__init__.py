@@ -165,6 +165,10 @@ class EngineCoreOutput(
 
     pooling_output: torch.Tensor | None = None
 
+    # Captured intermediate layer hidden states, keyed by layer index.
+    # Only present when SamplingParams.hidden_state_layer_ids is set.
+    hidden_states: dict[int, torch.Tensor] | None = None
+
     finish_reason: FinishReason | None = None
     stop_reason: int | str | None = None
     events: list[EngineCoreEvent] | None = None

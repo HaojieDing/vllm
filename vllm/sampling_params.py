@@ -298,6 +298,13 @@ class SamplingParams(
     generated token can complete the sequence."""
     _bad_words_token_ids: list[list[int]] | None = None
 
+    hidden_state_layer_ids: list[int] | None = None
+    """If provided, the hidden states from these transformer layer indices will
+    be captured and returned in ``RequestOutput.hidden_states``.  Each entry
+    must be a valid 0-based layer index for the model being served.  The
+    hidden states are taken at the *last scheduled token position* for each
+    request (i.e. the same position used to compute logits)."""
+
     skip_reading_prefix_cache: bool | None = None
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""

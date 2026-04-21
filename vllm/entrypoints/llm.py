@@ -453,6 +453,7 @@ class LLM:
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
+        hidden_state_layer_ids: list[int] | None = None,
     ) -> list[RequestOutput]:
         """Generates the completions for the input prompts.
 
@@ -481,10 +482,17 @@ class LLM:
                 at the same index.
             tokenization_kwargs: Overrides for `tokenizer.encode`.
             mm_processor_kwargs: Overrides for `processor.__call__`.
+            hidden_state_layer_ids: If provided, the hidden states from these
+                transformer layer indices are captured and returned in
+                ``RequestOutput.hidden_states`` as a dict mapping layer index
+                to a CPU tensor of shape ``[hidden_size]``.  This forces eager
+                (non-CUDA-graph) execution for affected steps.
 
         Returns:
             A list of `RequestOutput` objects containing the
             generated completions in the same order as the input prompts.
+            When ``hidden_state_layer_ids`` is set, each output's
+            ``hidden_states`` attribute holds the captured tensors.
         """
         runner_type = self.model_config.runner_type
         if runner_type != "generate":
@@ -496,6 +504,19 @@ class LLM:
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
+
+        # Inject hidden_state_layer_ids into sampling params when specified.
+        if hidden_state_layer_ids is not None:
+            if isinstance(sampling_params, SamplingParams):
+                sampling_params = sampling_params.clone()
+                sampling_params.hidden_state_layer_ids = hidden_state_layer_ids
+            else:
+                updated: list[SamplingParams] = []
+                for sp in sampling_params:
+                    sp = sp.clone()
+                    sp.hidden_state_layer_ids = hidden_state_layer_ids
+                    updated.append(sp)
+                sampling_params = updated
 
         return self._run_completion(
             prompts=prompts,

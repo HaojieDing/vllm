@@ -191,6 +191,11 @@ class ModelRunnerOutput:
     # [num_reqs, hidden_size]
     pooler_output: list[torch.Tensor | None] | None = None
 
+    # Per-request intermediate layer hidden states captured during forward.
+    # Outer list is indexed by req position (same as req_ids).
+    # Inner dict maps layer_idx -> tensor of shape [hidden_size].
+    hidden_states_output: list[dict[int, torch.Tensor] | None] | None = None
+
     kv_connector_output: KVConnectorOutput | None = None
 
     ec_connector_output: ECConnectorOutput | None = None
